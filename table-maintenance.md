@@ -1,0 +1,86 @@
+# Table maintenance
+
+## Unsorted data
+
+When loading new data with a sort key, Redshift does not resort and rewrite all the existing blocks already on disk.
+
+To query the percent of unsorted rows in a table, we can use the `svv_table_info`.
+
+```sql
+select unsorted
+from svv_table_info
+where "table" = 'users'
+```
+
+| unsorted |
+| -------  |
+| 17.11    |
+
+The result shows that  17.11% of the `users` table is unsorted.
+
+When the table contains a sort key, you can try to load the data in sort key order to avoid introducing unsorted data. For example, if you sort the `users` table on `registered_at` or `user_id`, newly appended rows will not overlap with the existing zone maps. If you were to sort on the `country_code`, newly added rows will most likely overlap with existing zone maps. Zone maps are most effective when the min-max ranges don't overlap.
+
+Here's an example of a healthy looking zone maps containing numbers.
+
+| block | min      | max      |
+| ----- | -------- | -------- |
+| 1     | 1        | 100      |
+| 2     | 101      | 200      |
+| 3     | 201      | 300      |
+| 4     | 301      | 400      |
+
+If Redshift needs to count all columns with a value `151`, Redshift can - based on the zone maps, exclude all blocks except for block 2. Redshift only needs to read a single block.
+
+When zone maps overlap, they could look like this.
+
+| block | min      | max      |
+| ----- | -------- | -------- |
+| 1     | 1        | 400      |
+| 2     | 50       | 200      |
+| 3     | 201      | 300      |
+| 4     | 100      | 400      |
+
+Based on these min-max ranges, Redshift can only exclude one block, block 3. This forces Redshift to read all three blocks, searching for the value `151`.
+
+## Deleted data
+
+When you're updating or deleting data, the data structures on disk will get fragmented. Because of Redshift's implementation of `MVCC`, blocks are marked for deletion when they're changed, but still linger around. The deleted blocks take up space on disk, but even worse, the query processor needs to know the block with the highest version, forcing a scan.
+
+To see how bad things are, you can query the system table `stv_tbl_perm`.
+
+```sql
+select
+  total,
+  visible,
+  total - visible AS marked_for_deletion
+from
+  ( select count(*) as visible
+    from currencies ) as a,
+  ( select sum(rows) as total
+    from pg_catalog.stv_tbl_perm
+    where name = 'currencies' ) as b
+```
+
+| total    | visible | marked_for_deletion |
+| ---------| ------- | ------------------- |
+| 1000     | 100     | 900                 |
+
+The result of this query shows that of the 1000 rows on disk, 100 are queryable and 900 are marked for deletion.
+
+Avoiding dead data as a whole is not that simple. You can try to avoid modifying existing blocks by reducing the number of (small) inserts, updates and deletes. Copy data in big batches as much as you can afford.
+
+## Vacuuming
+
+It's impossible to keep data in use to be fragmentation free. That's why Redshift also, like PostgreSQL, supports `VACUUM`. The `VACUUM` command gets rid of the blocks marked for deletion, reclaims space and restores the sort order.
+
+It's a good idea to clean house on a regular basis, but to not overdo it either. `VACUUM` is an expensive operation that will temporarily degrade cluster performance. It should be scheduled outside business hours as much as possible or after you've really made a mess of things (after a nightly batch of imports for example).
+
+Redshift helps you avoid being too eager when doing maintenance. By default, `VACUUM` will skip the sort phase for any table where more than 95% of the table's rows are already sorted. You can tweak this value on a per query basis, by adding `TO treshold PERCENT` to your query.
+
+The `VACUUM` command can be performed to a single table or the whole database. A handful of modes are supported: The `FULL` mode reclaims disk space and resorts unsorted rows. The `SORT ONLY` mode only resorts unsorted rows, without reclaiming disk space. The `DELETE ONLY` mode reclaims disk space, without resorting.
+
+```sql
+vacuum full order_items;
+```
+
+Make use of the statistics available in the system tables to decide whether table maintenance is really necessary and which `VACUUM` mode is best suited for the job. When your cluster hardly serves any queries outside business hours, it does not hurt to be thorough and to use that idle time to simply vacuum the whole database using sane tresholds.

@@ -1,0 +1,13 @@
+# The Author
+
+Jef Claes is a software engineer working and living in Belgium. In the past he worked in domains related to public safety and banking. These days he is employed by Green Island, building software for the online gambling industry.
+
+Outside business hours, he's an active member of [Domain Driven Design Belgium](https://www.meetup.com/dddbelgium/), writes on his personal blog [jefclaes.be](http://jefclaes.be) and speaks at the occassional conference.
+
+The best way to get in touch is through [Twitter](http://twitter.com/JefClaes).
+
+# Acknowledgements
+
+Thanks to Joe Harris, Redshift Database Engineer at AWS. He was kind enough to reach out on Twitter willing to help. He took the time to do a technical review and provide me with crucial improvements and corrections. I had never expected someone *actually* working on Redshift to help out in a big way like this.
+
+Kristien, my partner, encouraged me to write something a bit longer for a change. She was happy to help when I asked her to review the text for any obvious spelling and grammar mistakes. What a second pair of eyes can do!

@@ -1,0 +1,18 @@
+
+# Exporting data
+
+The `COPY` command makes bulk loading data into Redshift trivial. Its counterpart is the `UNLOAD` command. The `UNLOAD` command enables you to export the results of a query to S3. This is useful to export large data sets fast, without having to write too much code.
+
+```SQL
+unload ('select * from order_items')
+to 's3://webshop-archive-exports/export'
+```
+
+The `UNLOAD` operation writes one or more files (or parts) per slice in parallel. By disabling parallelization, you can force Redshift to only write a single file. Files have a maximum file size of 6.2GB. The file names are postfixed with a slice number and a part number.
+
+| filename               |
+| ---------------------- |
+| orderitems0000_part_00 |
+| orderitems0000_part_01 |
+| orderitems0001_part_00 |
+| ...                    |

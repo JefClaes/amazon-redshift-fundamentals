@@ -1,0 +1,121 @@
+# Query processing
+
+## Query plans
+
+When a client application sends a query to Redshift, the leader node first parses the query, then looks at statistics available and computes an optimized query plan. The query plan then gets sent to each compute node, where the query plan is executed and the results are returned to the leader node.
+
+Although query plans are executed by machines, with a bit of exercise their textual representation can be interpreted by humans as well. The `EXPLAIN` command returns a human readable version of the query plan for any given query.
+
+Let's first look at a simple `COUNT`.
+
+```sql
+explain
+select count(*)
+from order_items
+```
+
+```txt
+XN Aggregate  (cost=8887738.40..8887738.40 rows=1 width=0)
+  ->  XN Seq Scan on orderitems  (cost=0.00..7110190.72 rows=711019072 width=0)
+```
+
+The result represents a tree structure. Indentation and arrows are used to show the different nodes and child nodes of the tree. Lines are read bottom to top, each line representing a simplified operation. Details (between the brackets) show how much data is processed during the operation and what the relative cost is compared to the whole query plan. The cost consists of two values divided by dots (..). The first value is the cost of returning the first row, and the second value is the cost of completing the whole operation. Amount of data processed and its cost are based on statistics maintained by the database and do not reflect reality necessarily.
+
+In this example, the whole table needs to be scanned, since each row is counted. Once the rows have been counted, the result is aggregated into a single row. The costs are cumulative as you go up the plan. In this example, the cost of the `Aggregate` operation contains the cost of the `Seq Scan` on `OrderItems`. Between operations, you might notice a gap in the cost, this is due to the estimated start up cost of the operation.
+
+Now here's another example that's a bit more complex. We'll count the order items placed each year, sorted by the year they were placed in.
+
+```sql
+explain
+select data_trunc('year', placed_at), count(*)
+from order_items
+group by date_trunc('year', placed_at)
+order by data_trunc('year', placed_at)
+```
+
+```txt
+XN Merge  (cost=1000012509454.50..1000012509478.50 rows=9600 width=8)
+  Merge Key: date_trunc('year'::text, placedat)
+  ->  XN Network  (cost=1000012509454.50..1000012509478.50 rows=9600 width=8)
+        Send to leader
+        ->  XN Sort  (cost=1000012509454.50..1000012509478.50 rows=9600 width=8)
+              Sort Key: date_trunc('year'::text, placedat)
+              ->  XN HashAggregate  (cost=12508771.52..12508819.52 rows=9600 width=8)
+                    ->  XN Seq Scan on orderitems  (cost=0.00..8934836.80 rows=714786944 width=8)
+```
+
+This query plan is a bit longer, but the extra operations are pretty easy to map to the new query. Bottom up again, Redshift scans the order items, hashing the year and counting the items, to finally sort the result. This being a parallel operation, each slice sends its results to the leader node, for the leader node to merge them to a single result.
+
+In the next example, we query more than a single table. With this query we want to get a feel of the demographics of our user base. We look at which countries user logins are originating from and we join that with the language users have the website content served in.
+
+```sql
+explain
+select logins.country_code, users.lang, count(logins.id)
+from logins
+  inner join users on (logins.user_id = users.id)
+group by logins.country_code, users.lang
+```
+
+```txt
+XN HashAggregate  (cost=23048307962.53..23048307965.14 rows=1044 width=14)
+  ->  XN Hash Join DS_BCAST_INNER  (cost=1440.51..23048287989.65 rows=2663051 width=14)
+        Hash Cond: ("outer".userid = "inner".id)
+        ->  XN Seq Scan on logins (cost=0.00..26630.50 rows=2663050 width=13)
+        ->  XN Hash (cost=1152.41..1152.41 rows=115241 width=9)
+              ->  XN Seq Scan on users  (cost=0.00..1152.41 rows=115241 width=9)
+```
+
+This example shows a `JOIN` in action. First the `users` table gets scanned, hashing the relevant columns used to join and to aggregate. Then the logins are scanned, hashing the relevant columns once more. A prerequisite to join two sets of data together is that they are on the same node. First one table is transformed into a hash table living in memory, for then to probe that hash table with rows of the second table. Since the `users` table, nor the `logins` table were created using a distribution style, Redshift is forced to use the `DS_BCAST_INNER` operation to broadcast the whole inner table over the network to each node to complete the join operation. Even though Redshift tries its best to limit network traffic by broadcasting the smallest table possible, this still remains a super expensive operation.
+
+When data needs to be joined together, you should aim to put it on the same slice. In this example, we could change the distribution style of both tables to distribute over the `user_id` or to distribute one table over all slices. In this case, keeping other queries in mind, it could make sense to distribute the `users` to all slices. This really depends on how often the table changes, how much rows the table contains and how wide the rows are.
+
+Changing the `users` table distribution style to `ALL`, changes the query plan immediately. Distribution of data is no longer needed to perform the `HASH JOIN` operation.
+
+```txt
+XN HashAggregate  (cost=2328288.07..2328317.07 rows=11600 width=22)
+  ->  XN Hash Join DS_DIST_ALL_NONE  (cost=10.75..2326245.42 rows=272354 width=22)
+        Hash Cond: ("outer".userid = "inner".id)
+        ->  XN Seq Scan on logins  (cost=0.00..26630.50 rows=2663050 width=13)
+        ->  XN Hash  (cost=8.60..8.60 rows=860 width=17)
+              ->  XN Seq Scan on users  (cost=0.00..8.60 rows=860 width=17)
+```
+
+Looking at the query plan after you write a query is a good habit to get into. Seeing how the database works underneath the abstraction teaches you to think as one. Over time you grow a pretty good intuition of what the database will be doing for any given query. Once you're confident you can reason about data flowing through the system without peeking at the plan, the query plan turns into a tool to verify your assumptions. With Redshift being a distributed database, I'm even more frantic about avoiding costly mistakes.
+
+## Statistics
+
+Let's say I ask you to write a small program that joins two tables. Table A lives on node A, while table B lives on node B. Although nodes can communicate with eachother, your code is only allowed to run on node A or node B. Your objective is to make the code run as fast as possible. Being new to database development, you start by researching the most efficient algorithms to perform a `JOIN` operation. Quickly you learn that whether you implement a `NESTED LOOP`, a `HASH JOIN` or a `MERGE JOIN` heavily depends on how the data is layed out. Is the data sorted or is it unsorted? Another prerequisite to performing a `JOIN` operation is that the data needs to reside on the same node. Surely, since your code can only be deployed to one node, you want it to be deployed to the node that stores the largest table, so that you can copy the smaller table over the network. As is, this is just guess work. What you need is statistical meta-data on the data, or statistics.
+
+In Redshift, a component called the query planner makes these deicisions for you. The query planner makes use of statistics to compute an optimal plan to execute any given query. Once a plan has been generated, Redshift might decide to cache the result for any subsequent similar queries. This is why you shouldn't evaluate query performance the first time you run it.
+
+For the query planner to compute the most efficient plan, it needs statistics that are up-to-date. Redshift doesn't maintain statistics autonomously, it expects the user to run the `ANALYZE` command periodically.
+
+You can query the `svv_table_info` to see which tables have stale statistics.
+
+```sql
+select stats_off, table_id
+from svv_table_info;
+```
+
+When the `stats_off` value equals 0, stats are current, 100 is out of date.
+
+If you still want to go a bit deeper, you can query the `pg_statistic_indicator` table to see how many rows were inserted, updated or deleted since the last time the `ANALYZE` command was executed.
+
+```sql
+select
+  stairelid as table_id,
+  stairows  as total_rows,
+  staiins   as total_rows_inserted,
+  staidels  as total_rows_updated_deleted
+from pg_statistic_indicator
+```
+
+The `ANALYZE` command can analyze the complete database, a single table or even a collection of columns inside a table.
+
+Analyzing is an expensive operation and should be performed only when necessary. The smaller the scope of the operation, the better. You can either use the system tables to come up with your own balanced heuristics on when to re-analyze, or you can make use of the built-in `analyze_treshold_percent` variable. The value of this variable makes Redshift skip the `ANALYZE` operation if the percentage of rows that have changed since the last time the command ran is lower than the treshold. You can configure the treshold yourself.
+
+```SQL
+set analyze_treshold_percent_to 40;
+```
+
+When loading big batches of data using the `COPY` command, you can use the `STATUPDATE` overload to immediately recompute the statistics.
