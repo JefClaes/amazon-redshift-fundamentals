@@ -147,7 +147,7 @@ diststyle all
 
 ## Durability and fault tolerance
 
-So far we've seen that Redshift uses a cluster of nodes as a means to distribute data and to parallelize computation. In general, with each component added to a cluster of machines, the odds of failure increase. Each failure has the potential to bring the whole system to a halt, or even worse, to lose data.
+So far we've seen that Redshift uses a cluster of nodes as a means to distribute data and to parallelize computation. In general, with each component added to a cluster of machines, the odds of failure increase. Each failure has the potential to bring the whole system to a halt, or even worse, to lose data. It's advized to at least run two nodes in production.
 
 Redshift has two effective measures in place to prevent data loss, ensuring durability. When you load data, Redshift synchronously replicates this data to other disks in the cluster. Next to that, data is also automatically replicated to S3 to provide continuous and incremental backups. Note that synchronous replication is not supported in a single node cluster - there's nowhere to replicate to.
 

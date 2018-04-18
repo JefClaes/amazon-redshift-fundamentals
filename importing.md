@@ -1,0 +1,78 @@
+# Importing data
+
+There are two ways to load data into Redshift. You can use an `INSERT` statement, or you can use the `COPY` command. The `INSERT` statement inserts a single row, while the `COPY` command loads data in bulk. Both can participate in a transaction.
+
+## Multiversion Concurrency Control
+
+There are design decisions Redshift made that will make you always want to opt for bulk operations if possible. Blocks are immutable by design, this means that for each statement you execute on a single row, the database will need to clone a whole 1MB block. Immutable blocks allow Redshift to keep serving consistent reads while writes are happening. This is a technique called Multiversion Concurrency Control, or `MVCC` in short - used by many modern storage engines. So for each write, the modified block will be copied, incrementing its version number, while the old block will be marked for deletion. Even though the old block is marked for deletion, queries in flight can continue to read the block without seeing inconsistent data or having to retry. Queries that are issued after the last write, will query the block with the highest version. Compared to other datawarehouse solutions, this makes that bulk loading data into Redshift is an online solution. You can just write batches of data, without seeing blocked or inconsistent reads.
+
+The `COPY` command supports importing data from a handful of sources: Amazon S3 (Simple Storage Service), Amazon EMR (Elastic MapReduce) and Amazon DynamoDB.
+
+## Copy from S3
+
+When you're copying data from a relational database into Redshift, the best option is to use file based imports using Amazon S3. You read the data from the source database, write it to a file, compress the file and upload it to your private S3 bucket attaching a bit of useful meta data like file type, source etc. On the receiving end, you subscribe to an S3 event and import the file. Ideally, you persist the path of the uploaded file with its meta data to a small database and checkpoint the files you've imported. Having this secondary index into your private S3 bucket together with a checkpoint allows imports to pick up where they left off and to import the whole lot again later on.
+
+```sql
+copy order_items
+from 's3://webshop-archive/orderitems/v1/2017/12/21/log-1-5008441.zip'
+iam_role 'arn:aws:iam:123456:role/dwimport'
+```
+
+## Appending
+
+Immutable data makes shoveling data around so much easier in general. If the source database contains concepts like `clicks`, `events` or `transactions`, we can read the rows since our last checkpoint and write those to a file. To add the data to the destination Redshift database, it's just a single `COPY` command.
+
+When you're dealing with temporal data, such as `clicks` or `transactions`, chances are high the `timestamp` column is defined as the sort key. When the source data is also sorted by `timestamp`, Redshift won't need to change any blocks, resulting in an extremely efficient copy operation.
+
+## Deep Copy
+
+When the source database contains tables where rows change, and you can afford to have somewhat stale data or the data doesn't change often, you can consider replacing the destination table as a whole.
+
+When a new snapshot of the source table is uploaded, you can truncate the destination table and copy the file into the table.
+
+```sql
+-- delete table
+truncate table products;
+-- load table
+copy products
+from 's3://webshop-archive/products/v1/2017/12/21/snapshot-1.zip'
+iam_role 'arn:aws:iam:123456:role/dwimport';
+```
+
+This has one caveat though. The `TRUNCATE` command commits immediately and can not be rolled back. Between truncating the destination table and copying the new data from the source file, the table is empty, which could result in inconsistent results.
+
+By introducing a staging table and some intermediary steps, it's possible to replace the table's contents as one single atomic operation. This ensures queries never get to see an empty table.
+
+- Truncate the staging table
+- Begin a new transaction
+- Copy the data to the staging table
+- Rename the destination table, by postfixing it with `old`
+- Rename the staging table to the destination table by removing the `staging` postfix
+- Rename the old table, by changing the `old` postfix to `staging`
+- Commit the transaction
+
+```sql
+-- truncate staging table
+truncate table products_staging;
+
+-- replace destination table
+begin;
+
+copy products_staging
+from 's3://webshop-archive/products/v1/2017/12/21/snapshot-1.zip'
+iam_role 'arn:aws:iam:123456:role/dwimport';
+
+alter table products          rename to products_old;
+alter table products_staging  rename to products;
+alter table products_old      rename to products_staging;
+
+commit;
+```
+
+## Constraints
+
+As you've already noticed in the examples used in the previous chapters, defining the schema of a table in Redshift is not much different than it would be any other relational database. If you're used to other relational databases and have always been disciplined about defining constraints as part of your schema, you might be up for a surprise.
+
+Although Redshift allows you to define foreign keys and unique constraints, they are not enforced when modifying data. Can you imagine how expensive a load operation would be in a distributed database like Redshift? Each load operation would require all the slices to freeze time and to talk to one another before allowing a write to happen.
+
+This doesn't mean that you shouldn't define constraints though. Redshift makes use of the schema metadata to optimize query plans.
