@@ -1,6 +1,6 @@
 # Summary
 
-* [Introduction](introduction.md)
+* [Introduction](README.md)
 * [Storage](storage.md)
 * [Distribution](distribution.md)  
 * [Importing data](importing.md)  
