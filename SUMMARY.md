@@ -2,19 +2,21 @@
 
 * Introduction 
 
-### Storage
+* Storage
+    * [Columnar](storage/columnar.md)
+    * [Block metadata](storage/block-metadata.md)
+    * [Sort keys](storage/sort-keys.md)
+    * [Compression](storage/compression.md)
 
-* [Columnar](storage/columnar.md)
-* [Block metadata](storage/block-metadata.md)
-* [Sort keys](storage/sort-keys.md)
-    * [Compound](storage/sort-keys-compound.md)
-    * [Interleaved](storage/sort-keys-interleaved.md)
-* [Compression](storage/compression.md)
+* [Distribution](distribution/README.md)
+    * [Nodes](distribution/nodes.md)
+    * [Slices](distribution/slices.md)
+    * [Distribution style](distribution/style.md)
+    * [Durability and fault tolerance](distribution/ha.md)
 
-### Distribution
-
-* [Nodes](distribution/nodes.md)
-* [Slices](distribution/slices.md)
-* [Distribution style](distribution/style.md)
-* [Durability and fault tolerance](distribution/ha.md)
-
+* [Importing data](importing/README.md)
+    * [Multiversion Concurrency Control](importing/mvcc.md)
+    * [Copy from S3](importing/copy-from-s3.md)
+    * [Appending](importing/appending.md)
+    * [Deep Copy](importing/deep-copy.md)
+    * [Constraints](importing/constraints.md)
