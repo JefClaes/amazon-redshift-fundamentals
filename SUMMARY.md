@@ -13,4 +13,8 @@
 
 ### Distribution
 
+* [Nodes](distribution/nodes.md)
+* [Slices](distribution/slices.md)
+* [Distribution style](distribution/style.md)
+* [Durability and fault tolerance](distribution/ha.md)
 
