@@ -2,7 +2,7 @@
 
 * Introduction 
 
-* Storage
+* [Storage](storage/README.md)
     * [Columnar](storage/columnar.md)
     * [Block metadata](storage/block-metadata.md)
     * [Sort keys](storage/sort-keys.md)
