@@ -1,8 +1,63 @@
-# Distribution style
+# Distribution
+
+Now that we have a basic understanding of how Redshift stores data on disk, we'll have a look at the composition of a Redshift cluster.
+
+## Nodes
+
+A Redshift cluster contains one or multiple nodes. Each cluster contains exactly one leader and one or more compute nodes. If you have a cluster with only one node in it, this node assumes both roles: leader and compute.
+
+As a client application, the composition of a cluster is transparent to you. You will always only talk to the leader node. The leader node is responsible for the intake and coordination of queries.  When the leader node receives a query, it first parses the query and turns it into an optimized execution plan. These steps will then be compiled into code and distributed to the compute nodes. When the compute nodes return intermediate result sets, the leader merges these together and replies to the client application.
+
+```txt
+              Client
+                |
+                |
+              Leader
+      ---------------------
+    /           |          \
+ | Compute | Compute | Compute |
+
+```
+
+## Slices
+
+Redshift even divides the system up into more little computation units. Each compute node is chopped into slices. Each slice is allocated a portion of the machine's disk, memory and CPU. Workloads are then distributed over these slices, having even more isolated individual units working in parallel to come up with results fast.
+
+```txt
+            Client
+              |
+              |
+            Leader
+        -------------
+       /       |      \
+| Compute | Compute | Compute |
+| ------- | ------- | --------|
+| Slice 0 | Slice 2 | Slice 4 |
+| Slice 1 | Slice 3 | Slice 5 |
+
+```
+
+The number of nodes and slices assigned to your cluster, can be found in the `stv_slices` table.
+
+```sql
+select node, slice
+from stv_slices;
+```
+
+| node | slice |
+| ---- | ----- |
+| 0    | 0     |
+| 0    | 1     |
+| 1    | 2     |
+| 1    | 3     |
+
+Inspecting the result, you can see I'm using a small cluster with 2 nodes that only contain 2 slices per node.
+
+## Distribution style
 
 When you insert data into a table, the leader node decides how it is distributed over the slices in the Redshift cluster. When you create a table, you can choose between three distribution styles: even, key and all. The way a table is distributed over the cluster has a big impact on performance. Ideally, you want to distribute data evenly across the cluster while collocating related data. When a slice executing a query requires data that lives somewhere else, Redshift is forced to talk to other nodes in its network and copy some of their data over. In any distributed application, you want to distribute work in a way that allows each node to focus on the work at hand by keeping the overhead of communication to a bare minimum.
 
-## Even distribution
+### Even distribution
 
 Using this style, the leader node will distribute the table over all the slices in the cluster in a round-robin fashion.
 
@@ -10,7 +65,7 @@ The denormalized `order_items` table we used earlier is a good candidate for an 
 
 When you don't specify a style when creating a table, this is the default.
 
-## Key distribution
+### Key distribution
 
 Using key distribution, a single column decides how the table is distributed over the slices. Try to choose a key that distributes the data evenly over the slices, while considering which tables it will often be joined with.
 
@@ -74,7 +129,7 @@ select table, skew_rows
 from svv_table_info
 ```
 
-## All distribution
+### All distribution
 
 In a star schema, you'll notice that it's more often than not impossible to optimize for all cases. The all distribution can come in handy here. With this distribution style, a table is distributed to all nodes. This works really well for smaller tables that don't change much. Distributing a table to each node will improve query performance when this table is often included in a join, but importing the data will also take much longer because it needs to be distributed to each node.
 
@@ -89,3 +144,13 @@ create table products (
   ... )
 diststyle all
 ```
+
+## Durability and fault tolerance
+
+So far we've seen that Redshift uses a cluster of nodes as a means to distribute data and to parallelize computation. In general, with each component added to a cluster of machines, the odds of failure increase. Each failure has the potential to bring the whole system to a halt, or even worse, to lose data.
+
+Redshift has two effective measures in place to prevent data loss, ensuring durability. When you load data, Redshift synchronously replicates this data to other disks in the cluster. Next to that, data is also automatically replicated to S3 to provide continuous and incremental backups. Note that synchronous replication is not supported in a single node cluster - there's nowhere to replicate to.
+
+A Redshift cluster is actively monitored for disk and node failures. In case of a disk failing on a single node, the node automatically starts using an in-cluster replica of the failing drive, while Redshift starts preparing a new healthy drive. When a node dies, Redshift stops serving queries until the cluster is healthy again. It will automatically provision and configure a new node, resuming operations when data is consistent again.
+
+In theory, you can expect an unhealthy cluster to heal itself - without any intervention. Depending on the gravity of the failure, some downtime is to be expected. Redshift favors consistency over availability.
