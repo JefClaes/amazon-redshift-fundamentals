@@ -1,12 +1,7 @@
 # Summary
 
 * Introduction 
-
-* [Storage](storage/README.md)
-    * [Columnar](storage/columnar.md)
-    * [Block metadata](storage/block-metadata.md)
-    * [Sort keys](storage/sort-keys.md)
-    * [Compression](storage/compression.md)
+* [Storage](storage.md)
 
 * [Distribution](distribution/README.md)
     * [Nodes](distribution/nodes.md)

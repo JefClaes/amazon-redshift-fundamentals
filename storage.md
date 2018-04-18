@@ -1,0 +1,320 @@
+# Storage
+
+In the first chapter, we'll have a look at how Redshift stores data on disk. How columnar storage is different from row-based storage, and how it makes certain workloads run much faster than other databases.
+
+## Columnar
+
+A lot of tools we use to store, manipulate and visualize data, have conditioned us to reason about data in a row-based fashion. It starts even before we ever touch a computer. Most of us learn to write left-to-right, top-to-bottom, appending line after line. It takes a bit of will to learn to reason about data in dimensions we're not used to.
+
+Let's look at this table that contains a bunch of data on individual order items. The table is highly denormalized. A single row contains more than 30 columns.
+
+| id  | placed_at        | customer_id | order_id  | product_id | price  | tax    |currency  | ... |
+| --  | --------------  | --------   | ---------| --------- | -----  | -------| --------- | --- |
+| 1   | 2014-1-1 00:01  | 859        | 1        | 210       | 50.00  | 10.50  | EUR       | ... |
+| 2   | 2014-1-1 00:02  | 20151      | 1        | 169       | 20.00  | 4.20   | EUR       | ... |
+| 3   | 2014-1-1 00:03  | 6          | 2        | 2         | 10.00  | 0.00   | USD       | ... |
+
+To compare apples to apples, we'll first load this data in a row-based database. The database is set up to store each table in a dedicated file. Each file is chopped up into fixed-size blocks. Depending on the size of the rows, multiple rows might fit in a block, or a row might need multiple blocks to hold a complete row. All rows we persist are stored in the same file, conveniently named `table_orderitems.data`.
+
+| block 0 | block 1 | block 2 | block.. |
+| ------- | ------- | ------- | ------- |
+| row 1   | row 2   | row 3   | row..   |
+
+After loading the order items for the last ten years, the file has grown to take up 79GB on disk. We can now start questioning the data. We'll query the sum of all items sold, grouped by the currency.
+
+```sql
+select sum(price), currency
+from order_items
+group by currency;
+```
+
+Since the smallest unit of IO the database can work with is a block, the database will have to read all the blocks in the `table_orderitems.data` file when executing the query for the first time. Even though we only really care about the `price` and the `currency` columns.
+
+Columnar databases optimize for this type of workloads by laying out data differently. If we load the order items data set in a columnar database, we also end up with a `table_orderitems.data` file, but the blocks contain column values instead of full rows. So instead of having to read the full 79GB from disk, our query can now only read the blocks that contain the values of the `price` and `currency` columns. Meaning the query can now be satisfied by reading only a fraction of the data from disk, instead of the full 79GB.
+
+| block 0  | block 1  | block 3  | block..  |
+| -------  | -------  | -------  | -------  |
+| column 0 | column 0 | column 0 | column.. |
+
+This makes columnar databases extremely efficient for read workloads that only require a small set of columns, but inefficient for those that read full rows. Efficient for the type of queries you often find in reporting, business intelligence or analytics - or OLAP in short. Inefficient for those you find in a transaction processing application - OLTP. When your queries require a large set of columns you will often be better off sticking to a row-based database.
+
+Redshift stores tables in their own file in the data directory. However, the file won't be named `table_orderitems.data`. Redshift assigns each file an internally assigned `filenode` number. You can query the catalog tables to find out the file name, but Redshift won't allow you access to the underlying storage to verify if the file really exists on disk.
+
+```sql
+select relname, relfilenode
+from pg_catalog.pg_class
+where relname = 'order_items';
+```
+
+| relname     | relfilenode |
+| ----------  | ------------|
+| order_items | 174738      |
+
+As we learned earlier, files are divided up into blocks, and blocks contain column values. We can peek inside a file and see how many blocks are used per column.
+
+```sql
+select col, count(*) AS blocks
+from stv_blocklist, stv_tbl_perm
+where stv_blocklist.tbl = stv_tbl_perm.id
+  and stv_blocklist.slice = stv_tbl_perm.slice
+  and stv_tbl_perm.id = 174738
+group by col
+order by col;
+```
+
+| col | blocks |
+| --- | ------ |
+| 0   | 624    |
+| 1   | 1672   |
+| 2   | 1304   |
+| ... | ...    |
+| 30  | 28     |
+| 31  | 28     |
+| 32  | 4940   |
+
+The result shows 33 columns, 3 more than expected. The last three columns are hidden columns used by Redshift: `insert_xid`, `delete_xid` and `row_id`.
+
+Now that we know the number of blocks used to store a single column, we're still missing one piece of vital information: the block size. Redshift's user interaction layer is based on PostgreSQL. So if you have experience tweaking and running a PostgreSQL installation, you might remember the `show block_size` command off the top of your head. However, executing this command in Redshift - even when we're logged in as root, returns an error saying we have insufficient permissions. A good reminder Redshift is a piece of proprietary technology running on rented infrastructure. Fortunately the Redshift docs state more than once that the block size is set to 1MB.
+
+In databases designed for OLTP workloads you will find far smaller block sizes (2KB, 4KB, 8KB and up). Smaller block sizes yield good results when you read and write small pieces of data and do random IO. Large block sizes perform better when you write and read large pieces of data in a sequential fashion. They waste less space storing block meta data and reduce the number of IO operations.
+
+If you multiply the number of blocks by the block size, you end up with the actual space on disk being used to store a column or a table. A block size of 1MB makes the calculation very simple.
+
+## Block metadata
+
+When Redshift writes blocks, it stores a bit of meta data for each block. A vital piece of information stored is the minimum and maximum value in each block, creating zone maps. Zone maps can speed up queries drastically by allowing Redshift to skip whole blocks while scanning for data.
+
+As an example, let's say we want to query how many order items were placed in 2018.
+
+```sql
+select count(*)
+from order_items
+where placed_at between '2018-1-1' and '2019-1-1'
+```
+
+We can query the block meta data for the `placed_at` column.
+
+```sql
+select
+  blocknum as block,
+  minvalue as min,
+  maxvalue as max
+from stv_blocklist, stv_tbl_perm
+where stv_blocklist.tbl = stv_tbl_perm.id
+  and stv_blocklist.slice = stv_tbl_perm.slice
+  and stv_tbl_perm.name = 'order_items'
+  and stv_blocklist.col = 1 /* placed_at */
+order by blocknum
+```
+
+After translating the min and max value, the result set looks something like this.
+
+| block | min       | max       |
+| ----- | --------- | --------- |
+| 0     | 2014-1-1  | 2014-2-3  |
+| 1     | 2014-2-3  | 2014-3-8  |
+| ...   | ...       | ...       |
+| 1500  | 2018-1-1  | 2018-1-11 |
+| 1501  | 2018-1-11 | 2018-1-25 |
+
+Having this piece of information allows Redshift to skip all blocks except for block 1500 and 1501. Admittedly, because the values of the `placed_at` column are sequential, the efficiency of this query is phenomenal.
+
+If we look at another column that has no sequential order, like `price`, the use of zone maps becomes way less efficient.
+
+| block | min      | max      |
+| ----- | ---------| ---------|
+| 0     | 1        | 3499     |
+| 1     | 1        | 2999     |
+| ...   | ...      | ...      |
+| 400   | 1        | 2875     |
+| 401   | 1        | 3889     |
+
+If we query the `order_items` table for items that cost less than 100 EUR, we can't skip any blocks and will have to scan each block individually. If we were interested in items that cost more than 3000 EUR, we would be able to skip roughly 50% of all blocks.
+
+## Sort keys
+
+In a row-based database, indexes are used to improve query performance. An index is a data structure that allows for faster data retrieval. A clustered index defines in which order rows are stored on disk, while a non-clustered index is a separate data structure sitting next to a table. It stores a small set of individual columns together with a pointer to the full row in the table. This means the database can scan this small tree structure instead of the complete table.
+
+For example, 7 values of the `price` column might translate to this small tree structure which is faster to scan than a list of 7 values.
+
+```txt
+              | 10
+      | 20 -- |
+      |       | 30
+50 --
+      |       | 60
+      | 72 -- |
+              | 100
+```
+
+While indexes can make all the difference in a row-based database, you can't just try to make a row-based database behave like a columnnar database by adding indexes to each column. Indexes need to be maintained with each write to a table. The cost of both IO in time and storage increases with each index added.
+
+Redshift doesn't implement non-clustered indexes since each column almost acts as its own index. However as proven by the `placed_at` range query earlier, the order of column values in blocks makes a big difference in query performance by making zone maps extremely efficient. Redshift allows you to define a sort key, similar to a clustered index, deciding which column values will be sorted on disk writes. The `order_items` sort key was created on the `placed_at` column, since we tend to look at a lot of our data month by month.
+
+```sql
+create table order_items (
+  id        integer   not null,
+  placed_at timestamp not null,
+  ...
+)
+sortkey (placed_at)
+```
+
+The sort key can either be a single column or a composition of multiple columns.
+
+There are two styles of sort keys: compound and interleaved. To have a benchmark, we'll use a query that counts the number of items sold where the `customer_id = 1`  and the `product_id = 2`.
+
+```sql
+select count(*)
+from order_items
+where customer_id = 1 and product_id = 2
+```
+
+### Compound
+
+Since there is more than one column in the predicate, we'll compose a compound sort key containing both `customer_id` and `product_id`. The compound key looks just like the result of an `order by` on two columns.
+
+| block | customer_id  | product_id |
+| ----- | -----------  | ---------- |
+| 1     | 1            | 1          |
+| 1     | 1            | 2          |
+| 1     | 1            | 3          |
+| 1     | 1            | 4          |
+| 2     | 2            | 1          |
+| 2     | 2            | 2          |
+| 2     | 2            | 3          |
+| 2     | 2            | 4          |
+| 3     | 3            | 1          |
+| 3     | 3            | 2          |
+| 3     | 3            | 3          |
+| 3     | 3            | 4          |
+| 4     | 4            | 1          |
+| 4     | 4            | 2          |
+| 4     | 4            | 3          |
+| 4     | 4            | 4          |
+
+Using this sorting style, Redshift only needs to read a single block; the first one. The zone maps contain enough data to quickly eliminate the other blocks.
+
+However, if we would only count the `product_id` values that equal 3, the whole sort key becomes way less efficient. Redshift is forced to scan all blocks when the sort key prefix is not involved in the predicate.
+
+### Interleaved
+
+When you want to assign each column in the sort key an equal weight, you can use an interleaved sort key instead of a compound one. Redshift will reduce multiple columns to one dimension, while preserving locality of the data points. Sorting and querying an interleaved key can be visualized as laying values out over a multi-dimensional graph, looking at the data points as coordinates of a map, chopping up the map in blocks.
+
+```txt
+  ProductId
+  |              |
+4 | (1,4)  (2,4) | (3,4) (4,4)
+  |              |
+3 | (1,3)  (2,3) | (3,3) (4,3)
+  |--------------| -------------
+2 | (1,2)  (2,2) | (3,2) (4,2)
+  |              |
+1 | (1,1)  (2,1) | (3,1) (4,1)
+  |_ _ _ _ _ _ _ | _ _ _ _ _ _ _  CustomerId
+    1      2      3    4
+```
+
+| block | customer_id | product_id |
+| ----- | ----------  | ---------- |
+| 1     | 1           | 1          |
+| 1     | 1           | 2          |
+| 1     | 2           | 1          |
+| 1     | 2           | 2          |
+| 2     | 1           | 3          |
+| 2     | 1           | 4          |
+| 2     | 2           | 3          |
+| 2     | 2           | 4          |
+| 3     | 3           | 1          |
+| 3     | 3           | 2          |
+| 3     | 4           | 1          |
+| 3     | 4           | 2          |
+| 4     | 3           | 3          |
+| 4     | 3           | 4          |
+| 4     | 4           | 3          |
+| 4     | 4           | 4          |
+
+If we now query for a specific `customer_id`, Redshift will have to read two blocks. When we query a specific `product_id`, Redshift will also have to read two blocks. However, when we query a specific `customer_id` for a specific `product_id`, Redshift will only need to read one block. When all the columns in the sort key are specified, we can pinpoint the exact location of the data. The less columns in the sort keys we specify in the predicate, the harder it becomes to know the exact location of the data. Once again, it's very much like a spatial search. If I'd tell you the coordinate of a location with a partial coordinate of (0, ?), you would know the location has to be somewhere on the equator, but you wouldn't be able to pinpoint the exact location.
+
+## Compression
+
+When we use compression, we choose to pay a higher price of compute in order to reduce the cost of storing and shuffling data around by making our data smaller. When you consider your application to be IO bound, making use of compression might have a big impact. Whether or not compression will bring the improvements you hope for, depends on whether the data suits the chosen compression algorithm.
+
+Row-based databases often support compression on the row- or block level. One way to compress a sample data set containing 4 rows, is by building a dictionary which stores each unique value together with an index, and replacing the values inside the rows with its index.
+
+```txt
+# Uncompressed
+
+| price  | tax    | currency |
+| -----  | -------| -------- |
+| 50.00  | 10.00  | EUR      |
+| 50.00  | 10.00  | USD      |
+| 50.00  | 10.00  | EUR      |
+| 100.00 | 20.00  | EUR      |
+
+# Dictionary
+
+| index | value  |
+| ----- | ------ |
+| 0     | 50.00  |
+| 1     | 10.00  |
+| 2     | 100.00 |
+| 3     | 20.00  |
+| 4     | EUR    |
+| 5     | USD    |
+
+# Compressed
+
+| price | tax    | currency |
+| ----- | -------| -------- |
+| 0     | 1      | 4        |
+| 0     | 1      | 5        |
+| 0     | 1      | 4        |
+| 2     | 3      | 4        |
+```
+
+The dictionary will be stored on the same block as the rows as a part of the header. Keeping the size of the dictionary in mind, this algorithm compresses the contents of the block by approximately 35%.
+
+To improve the compression ratio, we need to make the dictionary more efficient. We can consider the dictionary more efficient when it is smaller relative to the size of the data set. This can be achieved by feeding the algorithm data that's more homogeneous and contains fewer distinct values. These are two requirements that columnar storage can easily satisfy.
+
+Because columnar databases group column values together, the values share the same type, making the data set to compress homogeneous. When the data set is guaranteed to be of single type, we can - instead of a one-size-fits-all algorithm - choose a compression algorithm that best suits the data.
+
+There are a few obvious examples of this. Timestamps are highly unique, but if we store the differences between each timestamp, we can save a lot of space. Long varchars, like the body of a tweet or a blog post, can benefit from a compression technique that stores individual words in a separate dictionary. For types like a boolean, you might want to avoid compression as a whole, the values are not going to get smaller than a single bit.
+
+Looking back to the dictionary approach, there's one other obvious change we can make to make it more efficient: make the blocks larger. The more data we compress, the better the odds of it containing the same value more than once. Redshift uses a block size of 1MB, yielding a much higher compression ratio than your day-to-day OLTP row-based database.
+
+7 types of compression encoding are supported:
+
+- RAW
+- Byte-Dictionary
+- Delta
+- LZO
+- Mostly
+- Runlength
+- Text255 and Text32k
+- Zstandard
+
+This gives us quite a few options to choose from, which might feel like a time-consuming task. However, Redshift doesn't really need us to get that intimate with our data set. Out of the box, there are tools available that help select the right compression encoding.
+
+If you already have a table that contains a usable amount of data, Redshift can analyze the columns for you and advise an optimal encoding.
+
+```sql
+analyze compression order_items;
+```
+
+| table       | column      | encoding | est_reduction_pct |
+| ----------- | ----------- | -------- | ----------------- |
+| order_items | id          | delta    | 0.00              |
+| order_items | placed_at   | zstd     | 39.83             |
+| order_items | customer_id | zstd     | 44.39             |
+| ...         | ...         | ...      | ...               |
+
+Pay attention though. The `ANALYZE COMPRESSION` command acquires an exclusive lock, preventing concurrent reads and writes against the table.
+
+When you bulk import data into a table using the `COPY` command - which is the recommended way, Redshift will automatically apply compression if all conditions are met. For automatic compression to be applied, the destination table needs to be empty, all columns need to have RAW or no encoding applied and there needs to be enough sample data in the source for the analysis to be reliable.
+
+```sql
+copy order_items from 's3://archive/orderitems.csv'
+```
+
+There is a notable difference between using the `ANALYZE COMPRESSION` command or having Redshift automatically apply compression during the `COPY` operation. The `ANALYZE COMPRESSION` command looks for minimum space usage and will very frequently recommend `ZStandard`. The `COPY` command on the other hand looks for the most time efficient encoding, which will most likely be `LZO`.
