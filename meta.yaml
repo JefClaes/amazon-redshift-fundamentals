@@ -1,0 +1,25 @@
+---
+title: 'Amazon Redshift - Fundamentals'
+subject: Amazon Redshift
+author:
+- Jef Claes
+keywords: ebooks, pandoc, pdf, html
+rights: MIT License 
+language: en-US
+lang: en
+tags: [pandoc, pdf, epub, mobi creation]
+...
+stylesheet: epub.css
+# pandoc format arguments
+# because of security these options are limited
+format-arguments:
+    pdf: >
+        -S
+        --toc
+        --number-sections
+        -V mainfont='Latin Modern Roman' 
+        -V sansfont='Times New Roman' 
+        -V monofont=Arial -V fontsize=12pt -V version=1.10
+    html: -S --toc-depth=3 --chapters --number-sections --toc
+    epub: -S --epub-chapter-level=3 --number-sections --toc
+    mobi: ok
