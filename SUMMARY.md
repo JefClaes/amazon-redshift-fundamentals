@@ -8,4 +8,4 @@
 * [Exporting data](06.exporting.md)
 * [Query processing](07.query-processing.md)
 * [Workload management](08.wlm.md)
-* [Credits](09.credits.md)git
+* [Credits](09.credits.md)
