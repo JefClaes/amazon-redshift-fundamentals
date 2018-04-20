@@ -7,5 +7,6 @@ keywords: ebooks, pandoc, pdf, html
 rights: MIT License 
 language: en-US
 lang: en
+cover-image: "cover.png"
 tags: [pandoc, pdf, epub, mobi creation]
 ...
