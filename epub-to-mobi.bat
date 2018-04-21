@@ -1,0 +1,1 @@
+kindlegen.exe aws-redshift-fundamentals.epub
